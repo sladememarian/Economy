@@ -1,6 +1,5 @@
-
 import time
-import math
+
 from pymongo.errors import DuplicateKeyError
 
 from app.database import mongo
@@ -8,29 +7,21 @@ from app.services import economy, player as player_service
 from app.services.jobs import JOBS
 
 
+# xp drops off once a job is far below your level
 XP_FALLOFF_PER_LEVEL = 0.1
 MIN_XP_MULTIPLIER = 0.25
 
 
-def calculate_xp(
-    job_xp: int,
-    player_level: int,
-    required_level: int,
-) -> int:
-    gap = max(
-        0,
-        player_level - required_level,
-    )
+def calculate_xp(job_xp: int, player_level: int, required_level: int) -> int:
+    """Outgrown jobs teach you less, but always at least 1 xp."""
+    gap = max(0, player_level - required_level)
 
     multiplier = max(
         MIN_XP_MULTIPLIER,
         1 - XP_FALLOFF_PER_LEVEL * gap,
     )
 
-    return max(
-        1,
-        math.ceil(job_xp * multiplier),
-    )
+    return max(1, round(job_xp * multiplier))
 
 
 def format_remaining(seconds: int) -> str:
@@ -42,24 +33,25 @@ def format_remaining(seconds: int) -> str:
     return f"{seconds} ثانیه"
 
 
+# ==================================================
+# Cooldowns
+# ==================================================
+
 async def get_cooldown_remaining(
     player_id,
     job_id: str,
     cooldown: int,
     now: int,
 ) -> int:
+    """Seconds left before this job can be done again, 0 when ready."""
     document = await mongo.job_cooldowns().find_one(
-        {
-            "player_id": player_id,
-            "job_id": job_id,
-        }
+        {"player_id": player_id, "job_id": job_id}
     )
 
     if document is None:
         return 0
 
-    last_work_at = document.get("last_work_at", 0)
-    elapsed = max(0, now - last_work_at)
+    elapsed = now - document.get("last_work_at", 0)
 
     if elapsed >= cooldown:
         return 0
@@ -73,24 +65,23 @@ async def claim_cooldown(
     cooldown: int,
     now: int,
 ) -> bool:
+    """Stamp the cooldown, but only if the job is really ready.
+
+    Claiming before paying means two fast clicks cannot both earn money.
+    """
     result = await mongo.job_cooldowns().update_one(
         {
             "player_id": player_id,
             "job_id": job_id,
-            "last_work_at": {
-                "$lte": now - cooldown,
-            },
+            "last_work_at": {"$lte": now - cooldown},
         },
-        {
-            "$set": {
-                "last_work_at": now,
-            }
-        },
+        {"$set": {"last_work_at": now}},
     )
 
     if result.matched_count == 1:
         return True
 
+    # nothing matched, so either the job is on cooldown or never worked
     try:
         await mongo.job_cooldowns().insert_one(
             {
@@ -99,25 +90,17 @@ async def claim_cooldown(
                 "last_work_at": now,
             }
         )
+
         return True
 
     except DuplicateKeyError:
+        # a row already exists, which means it was still cooling down
         return False
 
 
-async def release_cooldown(
-    player_id,
-    job_id: str,
-    claimed_at: int,
-) -> None:
-    await mongo.job_cooldowns().delete_one(
-        {
-            "player_id": player_id,
-            "job_id": job_id,
-            "last_work_at": claimed_at,
-        }
-    )
-
+# ==================================================
+# Working
+# ==================================================
 
 async def do_work(
     telegram_id: int,
@@ -129,24 +112,22 @@ async def do_work(
     if job is None:
         return False, "❌ این شغل وجود ندارد."
 
-    player = await player_service.get_player(
-        telegram_id
-    )
+    now = int(time.time())
+
+    player = await player_service.get_player(telegram_id)
 
     if player is None:
         return False, "❌ بازیکن پیدا نشد."
 
+    # بررسی سطح شغل
     if player["level"] < job.required_level:
         return False, (
             f"🔒 <b>{job.name}</b> قفل است.\n\n"
-            f"⭐ سطح مورد نیاز: "
-            f"<b>{job.required_level}</b>\n"
-            f"⭐ سطح فعلی: "
-            f"<b>{player['level']}</b>"
+            f"⭐ برای باز کردن این شغل به سطح "
+            f"<b>{job.required_level}</b> نیاز داری."
         )
 
-    now = int(time.time())
-
+    # بررسی Cooldown برای نشان دادن زمان باقی‌مانده
     remaining = await get_cooldown_remaining(
         player_id=player["id"],
         job_id=job.id,
@@ -156,12 +137,13 @@ async def do_work(
 
     if remaining > 0:
         return False, (
-            "⏳ هنوز نمی‌تونی دوباره کار کنی.\n\n"
+            f"⏳ هنوز نمی‌تونی دوباره کار کنی.\n\n"
             f"💼 شغل: {job.emoji} {job.name}\n"
             f"⏱ زمان باقی‌مانده: "
             f"<b>{format_remaining(remaining)}</b>"
         )
 
+    # گرفتن قفل Cooldown قبل از پرداخت
     claimed = await claim_cooldown(
         player_id=player["id"],
         job_id=job.id,
@@ -181,48 +163,36 @@ async def do_work(
         required_level=job.required_level,
     )
 
-    try:
-        new_balance = await economy.add_money(
-            telegram_id=telegram_id,
-            amount=job.reward,
-            transaction_type=economy.TransactionType.JOB_REWARD,
-            description=f"دستمزد {job.name}",
-            also_inc={
-                "xp": earned_xp,
-                "total_jobs": 1,
-                "total_earned": job.reward,
-            },
-        )
-
-    except Exception:
-        await release_cooldown(
-            player_id=player["id"],
-            job_id=job.id,
-            claimed_at=now,
-        )
-        raise
-
-    progress = await player_service.sync_level(
-        telegram_id
+    # پول، تجربه و آمار در یک نوشتن اتمیک، پس هیچ‌وقت ناهمخوان نمی‌شوند
+    new_balance = await economy.add_money(
+        telegram_id=telegram_id,
+        amount=job.reward,
+        transaction_type=economy.TransactionType.JOB_REWARD,
+        description=f"دستمزد {job.name}",
+        also_inc={
+            "xp": earned_xp,
+            "total_jobs": 1,
+            "total_earned": job.reward,
+        },
     )
 
-    player_after = progress["player"]
+    # سطح از روی تجربه محاسبه می‌شود
+    progress = await player_service.sync_level(telegram_id)
 
     message = (
         f"{job.emoji} <b>{job.name}</b>\n\n"
-        "✅ کار با موفقیت انجام شد!\n\n"
+        f"✅ کار با موفقیت انجام شد!\n\n"
         f"💰 درآمد: <b>+{job.reward:,}</b> 🪙\n"
         f"⚡ تجربه: <b>+{earned_xp}</b>\n"
         f"💳 موجودی: <b>{new_balance:,}</b> 🪙\n"
         f"📊 تعداد کارها: "
-        f"<b>{player_after['total_jobs']}</b>"
+        f"<b>{progress['player']['total_jobs']}</b>"
     )
 
     if progress["leveled_up"]:
         message += (
-            "\n\n🎉 <b>Level Up!</b>\n"
-            f"⭐ سطح جدید: "
-            f"<b>{progress['new_level']}</b>"
+            f"\n\n🎉 <b>Level Up!</b>\n"
+            f"⭐ سطح جدید: <b>{progress['new_level']}</b>"
         )
 
     return True, message

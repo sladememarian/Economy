@@ -1,19 +1,7 @@
-from datetime import datetime, timezone
+import aiosqlite
 
-from bson import ObjectId
-
-from app.database import mongo
-from app.services import economy
-from app.services import player as player_service
-from app.services.businesses import (
-    BUSINESSES,
-    get_income_per_hour,
-    get_upgrade_price,
-)
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
+from app.database.db import DATABASE_PATH
+from app.services.businesses import BUSINESSES
 
 
 async def buy_business(
@@ -26,218 +14,292 @@ async def buy_business(
     if business is None:
         return False, "❌ این کسب‌وکار وجود ندارد."
 
-    player = await player_service.get_player(
-        telegram_id
-    )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
 
-    if player is None:
-        return False, "❌ بازیکن پیدا نشد."
-
-    if player["level"] < business.required_level:
-        return False, (
-            f"🔒 <b>{business.name}</b> قفل است.\n\n"
-            f"⭐ سطح مورد نیاز: "
-            f"<b>{business.required_level}</b>\n"
-            f"⭐ سطح فعلی: "
-            f"<b>{player['level']}</b>"
+        # پیدا کردن بازیکن
+        cursor = await db.execute(
+            """
+            SELECT
+                p.id AS player_id,
+                p.level,
+                w.id AS wallet_id,
+                w.balance
+            FROM players p
+            JOIN wallets w ON w.player_id = p.id
+            WHERE p.telegram_id = ?
+            """,
+            (telegram_id,),
         )
 
-    existing = await mongo.businesses().find_one(
-        {
-            "player_id": player["id"],
-            "business_type": business.id,
-        }
-    )
+        player = await cursor.fetchone()
 
-    if existing is not None:
-        return False, (
-            f"⚠️ تو قبلاً <b>{business.name}</b> رو خریدی."
-        )
+        if player is None:
+            return False, "❌ بازیکن پیدا نشد."
 
-    try:
-        new_balance = await economy.remove_money(
-            telegram_id=telegram_id,
-            amount=business.price,
-            transaction_type=(
-                economy.TransactionType.BUSINESS_PURCHASE
-            ),
-            description=f"خرید {business.name}",
-        )
+        # بررسی سطح
+        if player["level"] < business.required_level:
+            return False, (
+                f"🔒 <b>{business.name}</b> قفل است.\n\n"
+                f"⭐ سطح مورد نیاز: "
+                f"<b>{business.required_level}</b>\n"
+                f"⭐ سطح فعلی: "
+                f"<b>{player['level']}</b>"
+            )
 
-    except economy.InsufficientFunds as error:
-        return False, (
-            "❌ پول کافی نداری.\n\n"
-            f"💳 موجودی: <b>{error.balance:,}</b> 🪙\n"
-            f"💰 قیمت: <b>{error.required:,}</b> 🪙\n"
-            f"📉 کمبود: <b>{error.missing:,}</b> 🪙"
-        )
-
-    now = _now()
-
-    document = {
-        "player_id": player["id"],
-        "telegram_id": telegram_id,
-        "business_type": business.id,
-        "level": 1,
-        "purchased_at": now,
-        "last_income_at": now,
-        "created_at": now,
-        "updated_at": now,
-    }
-
-    try:
-        await mongo.businesses().insert_one(document)
-
-    except Exception:
-        await economy.add_money(
-            telegram_id=telegram_id,
-            amount=business.price,
-            transaction_type=economy.TransactionType.ADJUSTMENT,
-            description=(
-                f"بازگشت وجه خرید ناموفق {business.name}"
+        # بررسی خرید قبلی
+        cursor = await db.execute(
+            """
+            SELECT id
+            FROM businesses
+            WHERE player_id = ?
+              AND business_type = ?
+            """,
+            (
+                player["player_id"],
+                business.id,
             ),
         )
-        raise
 
-    income = get_income_per_hour(
-        business,
-        1,
-    )
+        existing = await cursor.fetchone()
+
+        if existing is not None:
+            return False, (
+                f"⚠️ تو قبلاً <b>{business.name}</b> رو خریدی."
+            )
+
+        # بررسی موجودی
+        if player["balance"] < business.price:
+            missing = business.price - player["balance"]
+
+            return False, (
+                f"❌ پول کافی نداری.\n\n"
+                f"💰 قیمت: <b>{business.price:,}</b> 🪙\n"
+                f"💳 موجودی: <b>{player['balance']:,}</b> 🪙\n"
+                f"📉 کمبود: <b>{missing:,}</b> 🪙"
+            )
+
+        # موجودی جدید
+        new_balance = player["balance"] - business.price
+
+        # کم کردن پول
+        await db.execute(
+            """
+            UPDATE wallets
+            SET balance = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                new_balance,
+                player["wallet_id"],
+            ),
+        )
+
+        # ثبت تراکنش
+        await db.execute(
+            """
+            INSERT INTO transactions (
+                wallet_id,
+                amount,
+                balance_after,
+                transaction_type,
+                description
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                player["wallet_id"],
+                -business.price,
+                new_balance,
+                "BUSINESS_PURCHASE",
+                f"خرید {business.name}",
+            ),
+        )
+
+        # ثبت کسب‌وکار
+        await db.execute(
+            """
+            INSERT INTO businesses (
+                player_id,
+                business_type,
+                level
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                player["player_id"],
+                business.id,
+                1,
+            ),
+        )
+
+        await db.commit()
 
     return True, (
-        "🎉 <b>خرید موفق!</b>\n\n"
-        f"{business.emoji} "
+        f"🎉 <b>خرید موفق!</b>\n\n"
+        f"{business.emoji} کسب‌وکار: "
         f"<b>{business.name}</b>\n"
-        f"📝 {business.description}\n\n"
-        "⭐ سطح: <b>1</b>\n"
+        f"⭐ سطح: <b>1</b>\n\n"
         f"💸 هزینه خرید: "
         f"<b>{business.price:,}</b> 🪙\n"
         f"💰 درآمد ساعتی: "
-        f"<b>{income:,}</b> 🪙\n"
+        f"<b>{business.income_per_hour:,}</b> 🪙\n\n"
         f"💳 موجودی فعلی: "
         f"<b>{new_balance:,}</b> 🪙"
     )
 
 
+
+
+
+
 async def upgrade_business(
     telegram_id: int,
-    business_id: ObjectId,
+    business_id: int,
 ) -> tuple[bool, str]:
 
-    player = await player_service.get_player(
-        telegram_id
-    )
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
 
-    if player is None:
-        return False, "❌ بازیکن پیدا نشد."
+        await db.execute("BEGIN IMMEDIATE")
 
-    document = await mongo.businesses().find_one(
-        {
-            "_id": business_id,
-            "player_id": player["id"],
-        }
-    )
+        try:
+            cursor = await db.execute(
+                """
+                SELECT
+                    b.id,
+                    b.business_type,
+                    b.level,
+                    p.id AS player_id,
+                    w.id AS wallet_id,
+                    w.balance
+                FROM businesses b
+                JOIN players p
+                    ON p.id = b.player_id
+                JOIN wallets w
+                    ON w.player_id = p.id
+                WHERE b.id = ?
+                  AND p.telegram_id = ?
+                """,
+                (
+                    business_id,
+                    telegram_id,
+                ),
+            )
 
-    if document is None:
-        return False, "❌ کسب‌وکار پیدا نشد."
+            row = await cursor.fetchone()
 
-    business = BUSINESSES.get(
-        document.get("business_type")
-    )
+            if row is None:
+                await db.rollback()
 
-    if business is None:
-        return False, "❌ نوع کسب‌وکار نامعتبر است."
+                return False, "❌ کسب‌وکار پیدا نشد."
 
-    current_level = document.get(
-        "level",
-        1,
-    )
+            business = BUSINESSES.get(
+                row["business_type"]
+            )
 
-    if current_level >= business.max_level:
-        return False, (
-            f"🏆 <b>{business.name}</b>\n\n"
-            f"این کسب‌وکار به حداکثر سطح "
-            f"<b>{business.max_level}</b> رسیده است."
-        )
+            if business is None:
+                await db.rollback()
 
-    upgrade_price = get_upgrade_price(
-        business,
-        current_level,
-    )
+                return False, "❌ کسب‌وکار نامعتبر است."
 
-    new_level = current_level + 1
+            current_level = row["level"]
 
-    updated = await mongo.businesses().update_one(
-        {
-            "_id": business_id,
-            "player_id": player["id"],
-            "level": current_level,
-        },
-        {
-            "$set": {
-                "level": new_level,
-                "updated_at": _now(),
-            }
-        },
-    )
+            # هزینه ارتقا
+            upgrade_price = (
+                business.price
+                * current_level
+            )
 
-    if updated.modified_count != 1:
-        return (
-            False,
-            "⏳ این کسب‌وکار همزمان توسط درخواست دیگری تغییر کرد.",
-        )
+            balance = row["balance"]
 
-    try:
-        new_balance = await economy.remove_money(
-            telegram_id=telegram_id,
-            amount=upgrade_price,
-            transaction_type=(
-                economy.TransactionType.BUSINESS_UPGRADE
-            ),
-            description=(
-                f"ارتقای {business.name} "
-                f"به سطح {new_level}"
-            ),
-        )
+            if balance < upgrade_price:
+                await db.rollback()
 
-    except economy.InsufficientFunds as error:
-        await mongo.businesses().update_one(
-            {
-                "_id": business_id,
-                "player_id": player["id"],
-                "level": new_level,
-            },
-            {
-                "$set": {
-                    "level": current_level,
-                    "updated_at": _now(),
-                }
-            },
-        )
+                return False, (
+                    f"❌ موجودی کافی نیست.\n\n"
+                    f"💳 موجودی: "
+                    f"<b>{balance:,}</b> 🪙\n"
+                    f"💰 هزینه ارتقا: "
+                    f"<b>{upgrade_price:,}</b> 🪙"
+                )
 
-        return False, (
-            "❌ موجودی کافی نیست.\n\n"
-            f"💳 موجودی: <b>{error.balance:,}</b> 🪙\n"
-            f"💰 هزینه ارتقا: "
-            f"<b>{error.required:,}</b> 🪙\n"
-            f"📉 کمبود: <b>{error.missing:,}</b> 🪙"
-        )
+            new_balance = (
+                balance - upgrade_price
+            )
 
-    new_income = get_income_per_hour(
-        business,
-        new_level,
-    )
+            new_level = current_level + 1
 
-    return True, (
-        "⬆️ <b>کسب‌وکار ارتقا پیدا کرد!</b>\n\n"
-        f"{business.emoji} "
-        f"<b>{business.name}</b>\n"
-        f"📝 {business.description}\n\n"
-        f"⭐ سطح جدید: <b>{new_level}</b>\n"
-        f"💰 درآمد ساعتی جدید: "
-        f"<b>{new_income:,}</b> 🪙\n\n"
-        f"💸 هزینه ارتقا: "
-        f"<b>{upgrade_price:,}</b> 🪙\n"
-        f"💳 موجودی: "
-        f"<b>{new_balance:,}</b> 🪙"
-    )
+            # کم کردن پول
+            await db.execute(
+                """
+                UPDATE wallets
+                SET balance = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    new_balance,
+                    row["wallet_id"],
+                ),
+            )
+
+            # ارتقای کسب‌وکار
+            await db.execute(
+                """
+                UPDATE businesses
+                SET level = ?
+                WHERE id = ?
+                """,
+                (
+                    new_level,
+                    business_id,
+                ),
+            )
+
+            # ثبت تراکنش
+            await db.execute(
+                """
+                INSERT INTO transactions (
+                    wallet_id,
+                    amount,
+                    balance_after,
+                    transaction_type,
+                    description
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    row["wallet_id"],
+                    -upgrade_price,
+                    new_balance,
+                    "BUSINESS_UPGRADE",
+                    f"ارتقای {business.name} به سطح {new_level}",
+                ),
+            )
+
+            await db.commit()
+
+            new_income = (
+                business.income_per_hour
+                * new_level
+            )
+
+            return True, (
+                f"⬆️ <b>کسب‌وکار ارتقا پیدا کرد!</b>\n\n"
+                f"{business.emoji} "
+                f"<b>{business.name}</b>\n\n"
+                f"⭐ سطح جدید: "
+                f"<b>{new_level}</b>\n"
+                f"💰 درآمد ساعتی جدید: "
+                f"<b>{new_income:,}</b> 🪙\n\n"
+                f"💸 هزینه ارتقا: "
+                f"<b>{upgrade_price:,}</b> 🪙\n"
+                f"💳 موجودی: "
+                f"<b>{new_balance:,}</b> 🪙"
+            )
+
+        except Exception:
+            await db.rollback()
+            raise

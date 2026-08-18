@@ -1,0 +1,11 @@
+.venv/
+.git/
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+data/
+tests/
+.env
+README.md
+requirements-dev.txt

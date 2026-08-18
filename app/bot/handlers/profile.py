@@ -2,6 +2,7 @@ from aiogram import Router
 from aiogram.types import CallbackQuery
 
 from app.bot.keyboards.profile import profile_menu
+from app.services.player import xp_progress
 from app.services.profile import get_profile
 
 
@@ -9,22 +10,24 @@ router = Router()
 
 
 def build_profile_text(player: dict) -> str:
-    level = player["level"]
-    xp = player["xp"]
+    progress = xp_progress(player["xp"])
 
-    xp_required = level * 100
+    xp_needed = progress["xp_needed"]
 
-    if xp_required > 0:
-        progress = min(int((xp / xp_required) * 10), 10)
+    if xp_needed > 0:
+        filled = min(
+            int((progress["xp_into_level"] / xp_needed) * 10),
+            10,
+        )
     else:
-        progress = 0
+        filled = 10
 
-    progress_bar = "🟩" * progress + "⬜" * (10 - progress)
+    progress_bar = "🟩" * filled + "⬜" * (10 - filled)
 
     return (
         f"👤 <b>پروفایل {player['first_name']}</b>\n\n"
-        f"⭐ سطح: <b>{level}</b>\n"
-        f"⚡ تجربه: <b>{xp} / {xp_required}</b>\n"
+        f"⭐ سطح: <b>{progress['level']}</b>\n"
+        f"⚡ تجربه: <b>{progress['xp_into_level']} / {xp_needed}</b>\n"
         f"{progress_bar}\n\n"
         f"🪙 کیف پول: <b>{player['balance']:,}</b>\n"
         f"🏦 بانک: <b>0</b>\n\n"

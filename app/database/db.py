@@ -1,3 +1,7 @@
+"""Legacy sqlite layer, kept only until business.py and my_businesses.py
+move to app/database/mongo.py. Do not add anything new here.
+"""
+
 from pathlib import Path
 
 import aiosqlite

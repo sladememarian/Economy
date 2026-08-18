@@ -5,18 +5,18 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 
-from app.config import BOT_TOKEN
-from app.database.db import init_database
+from app.config import PROXY_URL, require_bot_token
+from app.database.mongo import close_database, init_database
 
 from app.bot.handlers.start import router as start_router
 from app.bot.handlers.job import router as job_router
 from app.bot.handlers.profile import router as profile_router
 from app.bot.handlers.business import router as business_router
 
-PROXY_URL = "socks5://127.0.0.1:10808"
-
 
 async def main() -> None:
+    token = require_bot_token()
+
     await init_database()
 
     session = AiohttpSession(
@@ -24,7 +24,7 @@ async def main() -> None:
     )
 
     bot = Bot(
-        token=BOT_TOKEN,
+        token=token,
         session=session,
         default=DefaultBotProperties(
             parse_mode=ParseMode.HTML,
@@ -47,6 +47,7 @@ async def main() -> None:
 
     finally:
         await bot.session.close()
+        await close_database()
 
 
 if __name__ == "__main__":

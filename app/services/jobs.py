@@ -1,3 +1,5 @@
+
+
 from dataclasses import dataclass
 
 
@@ -22,17 +24,15 @@ JOBS = {
         cooldown=30,
         required_level=1,
     ),
-
     "driver": Job(
         id="driver",
         name="راننده",
-        emoji="🚚",
+        emoji="🚗",
         reward=180,
         xp=18,
         cooldown=45,
         required_level=2,
     ),
-
     "programmer": Job(
         id="programmer",
         name="برنامه‌نویس",
@@ -43,3 +43,11 @@ JOBS = {
         required_level=5,
     ),
 }
+
+
+def get_job(job_id: str) -> Job | None:
+    return JOBS.get(job_id)
+
+
+def get_all_jobs() -> dict[str, Job]:
+    return JOBS

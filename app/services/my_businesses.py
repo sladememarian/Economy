@@ -1,273 +1,247 @@
-import aiosqlite
-
-from app.database.db import DATABASE_PATH
-from app.services.businesses import BUSINESSES
-
-
 from datetime import datetime, timezone
+
+from bson import ObjectId
+
+from app.database import mongo
+from app.services import economy
+from app.services import player as player_service
+from app.services.businesses import (
+    BUSINESSES,
+    get_income_per_hour,
+)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def calculate_income(
     business_type: str,
     level: int,
-    last_income_at: str,
+    last_income_at: datetime | None,
 ) -> int:
 
-    business = BUSINESSES.get(business_type)
+    business = BUSINESSES.get(
+        business_type
+    )
 
     if business is None:
         return 0
 
-    try:
-        last_time = datetime.strptime(
-            last_income_at,
-            "%Y-%m-%d %H:%M:%S",
-        ).replace(tzinfo=timezone.utc)
-
-    except (ValueError, TypeError):
+    if last_income_at is None:
         return 0
 
-    now = datetime.now(timezone.utc)
+    if last_income_at.tzinfo is None:
+        last_income_at = last_income_at.replace(
+            tzinfo=timezone.utc
+        )
 
     elapsed_seconds = (
-        now - last_time
+        _now() - last_income_at
     ).total_seconds()
 
-    hours = int(elapsed_seconds // 3600)
+    if elapsed_seconds <= 0:
+        return 0
+
+    hours = int(
+        elapsed_seconds // 3600
+    )
 
     if hours <= 0:
         return 0
 
-    income_per_hour = (
-        business.income_per_hour * level
+    return hours * get_income_per_hour(
+        business,
+        level,
     )
 
-    return hours * income_per_hour
-
-
-# ==================================================
-# کسب‌وکارهای بازیکن
-# ==================================================
 
 async def get_my_businesses(
     telegram_id: int,
 ) -> list[dict]:
 
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    player = await player_service.get_player(
+        telegram_id
+    )
 
-        cursor = await db.execute(
-            """
-            SELECT
-                b.id,
-                b.business_type,
-                b.level,
-                b.purchased_at,
-                b.last_income_at
-            FROM businesses b
-            JOIN players p
-                ON p.id = b.player_id
-            WHERE p.telegram_id = ?
-            ORDER BY b.id ASC
-            """,
-            (telegram_id,),
+    if player is None:
+        return []
+
+    cursor = (
+        mongo.businesses()
+        .find(
+            {
+                "player_id": player["id"],
+            }
+        )
+        .sort(
+            [
+                ("created_at", 1),
+                ("_id", 1),
+            ]
+        )
+    )
+
+    result = []
+
+    async for document in cursor:
+        business = BUSINESSES.get(
+            document.get("business_type")
         )
 
-        rows = await cursor.fetchall()
+        if business is None:
+            continue
 
-        result = []
+        level = document.get(
+            "level",
+            1,
+        )
 
-        for row in rows:
-
-            business = BUSINESSES.get(
-                row["business_type"]
-            )
-
-            if business is None:
-                continue
-
-            income = calculate_income(
-                business_type=row["business_type"],
-                level=row["level"],
-                last_income_at=row["last_income_at"],
-            )
-
-            result.append({
-                "id": row["id"],
-                "business_type": row["business_type"],
+        result.append(
+            {
+                "id": document["_id"],
+                "business_type": document[
+                    "business_type"
+                ],
                 "name": business.name,
+                "description": business.description,
                 "emoji": business.emoji,
-                "level": row["level"],
-                "income_per_hour": (
-                    business.income_per_hour
-                    * row["level"]
+                "level": level,
+                "max_level": business.max_level,
+                "income_per_hour": get_income_per_hour(
+                    business,
+                    level,
                 ),
-                "pending_income": income,
-            })
+                "pending_income": calculate_income(
+                    business_type=document[
+                        "business_type"
+                    ],
+                    level=level,
+                    last_income_at=document.get(
+                        "last_income_at"
+                    ),
+                ),
+                "price": business.price,
+                "purchased_at": document.get(
+                    "purchased_at"
+                ),
+                "last_income_at": document.get(
+                    "last_income_at"
+                ),
+            }
+        )
 
-        return result
+    return result
 
-
-# ==================================================
-# دریافت درآمد
-# ==================================================
 
 async def collect_business_income(
     telegram_id: int,
-    business_id: int,
+    business_id: ObjectId,
 ) -> tuple[bool, str]:
 
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
+    player = await player_service.get_player(
+        telegram_id
+    )
 
-        # جلوگیری از دریافت همزمان درآمد
-        await db.execute("BEGIN IMMEDIATE")
+    if player is None:
+        return False, "❌ بازیکن پیدا نشد."
 
-        try:
-            cursor = await db.execute(
-                """
-                SELECT
-                    b.id,
-                    b.business_type,
-                    b.level,
-                    b.last_income_at,
-                    p.id AS player_id,
-                    w.id AS wallet_id,
-                    w.balance
-                FROM businesses b
-                JOIN players p
-                    ON p.id = b.player_id
-                JOIN wallets w
-                    ON w.player_id = p.id
-                WHERE b.id = ?
-                  AND p.telegram_id = ?
-                """,
-                (
-                    business_id,
-                    telegram_id,
-                ),
-            )
+    document = await mongo.businesses().find_one(
+        {
+            "_id": business_id,
+            "player_id": player["id"],
+        }
+    )
 
-            business_row = await cursor.fetchone()
+    if document is None:
+        return False, "❌ کسب‌وکار پیدا نشد."
 
-            if business_row is None:
-                await db.rollback()
+    business = BUSINESSES.get(
+        document.get("business_type")
+    )
 
-                return (
-                    False,
-                    "❌ کسب‌وکار پیدا نشد.",
-                )
+    if business is None:
+        return False, "❌ نوع کسب‌وکار نامعتبر است."
 
-            business = BUSINESSES.get(
-                business_row["business_type"]
-            )
+    level = document.get(
+        "level",
+        1,
+    )
 
-            if business is None:
-                await db.rollback()
+    last_income_at = document.get(
+        "last_income_at"
+    )
 
-                return (
-                    False,
-                    "❌ نوع کسب‌وکار نامعتبر است.",
-                )
+    income = calculate_income(
+        business_type=document["business_type"],
+        level=level,
+        last_income_at=last_income_at,
+    )
 
-            # محاسبه درآمد
-            income = calculate_income(
-                business_type=business_row["business_type"],
-                level=business_row["level"],
-                last_income_at=business_row["last_income_at"],
-            )
-            print(
-                "DEBUG COLLECT:",
-                {
-                    "telegram_id": telegram_id,
-                    "business_id": business_id,
-                    "last_income_at": business_row["last_income_at"],
-                    "income": income,
-                    "balance": business_row["balance"],
+    if income <= 0:
+        return False, (
+            "⏳ <b>هنوز درآمدی برای دریافت نداری.</b>\n\n"
+            f"{business.emoji} "
+            f"<b>{business.name}</b>\n"
+            f"⭐ سطح: <b>{level}</b>\n"
+            f"💰 درآمد ساعتی: "
+            f"<b>{get_income_per_hour(business, level):,}</b> 🪙"
+        )
+
+    now = _now()
+
+    updated = await mongo.businesses().update_one(
+        {
+            "_id": business_id,
+            "player_id": player["id"],
+            "last_income_at": last_income_at,
+        },
+        {
+            "$set": {
+                "last_income_at": now,
+                "updated_at": now,
+            }
+        },
+    )
+
+    if updated.modified_count != 1:
+        return False, (
+            "⏳ درآمد این کسب‌وکار "
+            "همین الان دریافت شد."
+        )
+
+    try:
+        new_balance = await economy.add_money(
+            telegram_id=telegram_id,
+            amount=income,
+            transaction_type=(
+                economy.TransactionType.BUSINESS_INCOME
+            ),
+            description=f"درآمد {business.name}",
+        )
+
+    except Exception:
+        await mongo.businesses().update_one(
+            {
+                "_id": business_id,
+                "player_id": player["id"],
+                "last_income_at": now,
+            },
+            {
+                "$set": {
+                    "last_income_at": last_income_at,
                 }
-            )
+            },
+        )
+        raise
 
-            if income <= 0:
-                await db.rollback()
-
-                return (
-                    False,
-                    f"⏳ <b>هنوز درآمدی برای دریافت نداری.</b>\n\n"
-                    f"{business.emoji} "
-                    f"<b>{business.name}</b>\n"
-                    f"⭐ سطح: "
-                    f"<b>{business_row['level']}</b>\n"
-                    f"💰 درآمد ساعتی: "
-                    f"<b>{business.income_per_hour * business_row['level']:,}</b> 🪙",
-                )
-
-            new_balance = (
-                business_row["balance"] + income
-            )
-
-            # افزایش موجودی
-            await db.execute(
-                """
-                UPDATE wallets
-                SET balance = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (
-                    new_balance,
-                    business_row["wallet_id"],
-                ),
-            )
-
-            # ثبت تراکنش
-            await db.execute(
-                """
-                INSERT INTO transactions (
-                    wallet_id,
-                    amount,
-                    balance_after,
-                    transaction_type,
-                    description
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    business_row["wallet_id"],
-                    income,
-                    new_balance,
-                    "BUSINESS_INCOME",
-                    f"درآمد {business.name}",
-                ),
-            )
-
-            # مهم:
-            # زمان دریافت درآمد را همین لحظه ثبت می‌کنیم
-            await db.execute(
-                """
-                UPDATE businesses
-                SET last_income_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (
-                    business_id,
-                ),
-            )
-
-            await db.commit()
-
-            return (
-                True,
-                f"💰 <b>درآمد دریافت شد!</b>\n\n"
-                f"{business.emoji} "
-                f"<b>{business.name}</b>\n"
-                f"⭐ سطح: "
-                f"<b>{business_row['level']}</b>\n\n"
-                f"💵 درآمد دریافتی: "
-                f"<b>+{income:,}</b> 🪙\n"
-                f"💳 موجودی جدید: "
-                f"<b>{new_balance:,}</b> 🪙",
-            )
-
-        except Exception:
-            await db.rollback()
-            raise
+    return True, (
+        "💰 <b>درآمد دریافت شد!</b>\n\n"
+        f"{business.emoji} "
+        f"<b>{business.name}</b>\n"
+        f"⭐ سطح: <b>{level}</b>\n\n"
+        f"💵 درآمد دریافتی: "
+        f"<b>+{income:,}</b> 🪙\n"
+        f"💳 موجودی جدید: "
+        f"<b>{new_balance:,}</b> 🪙"
+    )
